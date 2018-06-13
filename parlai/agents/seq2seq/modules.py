@@ -325,11 +325,14 @@ class Ranker(object):
 
         hid, cell = (hidden, None) if isinstance(hidden, torch.Tensor) else hidden
         if len(cand_inds) != hid.size(1):
+            # this means we are ranking on only a subset of the batch
             cand_indices = start.detach().new(cand_inds)
-            hid = hid.index_select(1, cand_indices)
+            hid = hid.index_select(1, cand_indices)  # select right hid states
             if cell is None:
+                # GRU/RNN
                 hidden = hid
             else:
+                # LSTM
                 cell = cell.index_select(1, cand_indices)
                 hidden = (hid, cell)
             enc_out = enc_out.index_select(0, cand_indices)
@@ -346,10 +349,12 @@ class Ranker(object):
             seqlens = 0
             # select just the one hidden state
             if isinstance(hidden, torch.Tensor):
+                # GRU/RNN
                 nl = hidden.size(0)
                 hsz = hidden.size(-1)
-                cur_hid = hidden.select(1, i).unsqueeze(1).expand(nl, n_cs, hsz)
+                cur_hid = hidden.select(1, i).unsqueeze(1).expand(nl, n_cs, hsz).contiguous()
             else:
+                # LSTM
                 nl = hidden[0].size(0)
                 hsz = hidden[0].size(-1)
                 cur_hid = (hidden[0].select(1, i).unsqueeze(1).expand(nl, n_cs, hsz).contiguous(),
@@ -357,6 +362,7 @@ class Ranker(object):
 
             cur_enc, cur_mask = None, None
             if attn_mask is not None:
+                # attention is on, so also select current encoder state
                 cur_mask = attn_mask[i].unsqueeze(0).expand(n_cs, attn_mask.size(-1))
                 cur_enc = enc_out[i].unsqueeze(0).expand(n_cs, enc_out.size(1), hsz)
             # this is pretty much copied from the training forward above
@@ -366,7 +372,8 @@ class Ranker(object):
             else:
                 xs, c_in = starts, curr_cs
             if self.attn_type == 'none':
-                preds, score, cur_hid = self.decoder(xs, cur_hid, cur_enc, cur_mask)
+                # teacher forcing--feed whole sequence in and get score
+                _p, score, _h = self.decoder(xs, cur_hid)
                 true_score = F.log_softmax(score, dim=2).gather(
                     2, curr_cs.unsqueeze(2))
                 nonzero = curr_cs.ne(0).float()
@@ -376,7 +383,7 @@ class Ranker(object):
                 for i in range(curr_cs.size(1)):
                     xi = xs.select(1, i)
                     ci = curr_cs.select(1, i)
-                    preds, score, cur_hid = self.decoder(xi, cur_hid, cur_enc, cur_mask)
+                    _p, score, cur_hid = self.decoder(xi, cur_hid, cur_enc, cur_mask)
                     true_score = F.log_softmax(score, dim=2).gather(
                         2, ci.unsqueeze(1).unsqueeze(2))
                     nonzero = ci.ne(0).float()
