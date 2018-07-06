@@ -15,6 +15,7 @@ except ImportError:
     )
 from fairseq import trainer, fp16_trainer
 from fairseq.sequence_generator import SequenceGenerator
+from fairseq.sequence_scorer import SequenceScorer
 from fairseq import options
 from fairseq.tasks.fairseq_task import FairseqTask
 from fairseq.utils import convert_padding_direction
@@ -311,7 +312,7 @@ class FairseqAgent(TorchAgent):
             # We need a placeholder task for fairseq
             self.task = _ParlaiTask(self.dict)
 
-            # actually construct the model and generator
+            # actually construct the model, generator, and scorer
             model_class = models.ARCH_MODEL_REGISTRY[self.args.arch]
             self.model = model_class.build_model(self.args, self.task)
             self.generator = SequenceGenerator(
@@ -326,6 +327,8 @@ class FairseqAgent(TorchAgent):
                 sampling_topk=self.args.sampling_topk,
                 sampling_temperature=self.args.sampling_temperature,
             )
+            self.scorer = SequenceScorer([self.model], self.dict)
+
             # set up the grader and the trainer
             self.criterion = criterions.build_criterion(self.args, self.task)
 
@@ -448,10 +451,31 @@ class FairseqAgent(TorchAgent):
         if batch.label_vec is not None:
             # Interactive mode won't have a gold label
             self.trainer.valid_step(samples)
-        # Grade each of the candidate sequences
-        # TODO: grade everything in observations[i]['label_candidates']
 
-        if not self.args.skip_generation:
+        # Grade each of the candidate sequences
+        if batch.candidate_vecs is not None:
+            bsz = len(batch.text_vec)
+            best_cands = []
+            reranked_cands = []
+            # score the candidates for each item in the batch separately, so that
+            # we can support variable number of candidates
+            for i in range(bsz):
+                cands = batch.candidate_vecs[i]
+                ncand = len(cands)
+                # repeat the input many times
+                xs = batch.text_vec[i].unsqueeze(0).expand(ncand, -1)
+                # and appropriately pack the outputs
+                ys, _ = self._padded_tensor(cands)
+                s = self._make_sample(xs, ys)
+                # perform the actual grading
+                scored = list(self.scorer.score_batched_itr([s], cuda=self.use_cuda))
+                scores = [s[3][0]['score'].item() for s in scored]
+                ranked, = self._argsort(scores, batch.candidates[i], descending=True)
+                reranked_cands.append(ranked)
+                # best candidate is the highest scoring of the items
+                best_cands.append(ranked[0])
+            return Output(best_cands, reranked_cands)
+        elif not self.args.skip_generation:
             # Next generate freely to create our response
             return Output(self._generate(samples), None)
 
@@ -538,6 +562,7 @@ class FairseqAgent(TorchAgent):
         # TODO: should the right/left padding thing be in torch agent?
         repadded = convert_padding_direction(xs, self.dict.pad(), right_to_left=True)
         sample = {}
+        sample["id"] = torch.range(0, len(xs) - 1)
         sample["net_input"] = {
             "src_tokens": repadded,
             "src_lengths": self._seq_length(xs),
